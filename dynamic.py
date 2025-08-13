@@ -1,0 +1,335 @@
+import os
+import sys
+import argparse
+import subprocess
+import json
+import tempfile
+import shutil
+import math
+
+
+# === CONFIGURATION: EDIT THE VALUES BELOW TO MATCH YOUR SETUP ===
+
+CONFIG = {
+    # --- Main Paths ---
+    "input_folder_path": "./qwen_testing/",
+    "output_html_dir": "./outputs",
+
+    # --- Input Data Settings ---
+    "type_of_input": "subfolder_images",  # Options: 'images' or 'subfolder_images'
+    
+    # --- Model and Task Settings ---
+    "output_type": "html",  # Options: 'html' or 'doc_type'
+    "model_type": "qwen2_5_vl",
+    "modality": "image",
+    
+    # --- Performance/System Settings ---
+    "disable_mm_preprocessor_cache": False,
+    "min_gpu_memory_mb": 70000, # Min free memory required for a GPU to be used
+}
+
+# === END OF CONFIGURATION ===
+
+# --------------- GPU Selection Utilities --------------- #
+def get_free_gpus(min_mem_mb=8000):
+    """
+    Returns a list of all free GPU IDs with at least `min_mem_mb` free memory.
+    """
+    try:
+        result = subprocess.run(
+            [
+                'nvidia-smi',
+                '--query-gpu=index,memory.free',
+                '--format=csv,noheader,nounits'
+            ],
+            capture_output=True, text=True, check=True
+        )
+        lines = result.stdout.strip().split('\n')
+        available = []
+        for line in lines:
+            if not line: continue
+            gpu_id, mem_free = map(str.strip, line.split(','))
+            if int(mem_free) > min_mem_mb:
+                available.append(gpu_id)
+        return available
+    except Exception as e:
+        print(f"Error while fetching GPU info: {e}")
+        return []
+
+def partition_gpus(num_available_gpus):
+    """
+    Partitions the total number of GPUs into chunks of valid TP sizes.
+    e.g., for 7 GPUs, returns [4, 2, 1]
+    """
+    valid_tp_sizes = [16, 8, 4, 2, 1]
+    
+    partitions = []
+    remaining_gpus = num_available_gpus
+    while remaining_gpus > 0:
+        size_to_use = 0
+        for size in valid_tp_sizes:
+            if size <= remaining_gpus:
+                size_to_use = size
+                break
+        
+        if size_to_use > 0:
+            partitions.append(size_to_use)
+            remaining_gpus -= size_to_use
+        else:
+            print(f"Warning: Could not partition remaining {remaining_gpus} GPUs. Stopping.")
+            break
+            
+    return partitions
+
+# ------------------------- Model Functions (Unchanged) ------------------------- #
+def run_qwen2_5_vl(question: str, modality: str, tensor_parallel_size: int, disable_mm_preprocessor_cache: bool):
+    from vllm import LLM
+    model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
+    llm = LLM(
+        model=model_name,
+        max_model_len=12000,
+        max_num_seqs=5,
+        mm_processor_kwargs={
+            "min_pixels": 28 * 28,
+            "max_pixels": 1280 * 28 * 28,
+            "fps": 1,
+        },
+        tensor_parallel_size=tensor_parallel_size,
+        disable_mm_preprocessor_cache=disable_mm_preprocessor_cache,
+    )
+    if modality == "image":
+        placeholder = "<|image_pad|>"
+    elif modality == "video":
+        placeholder = "<|video_pad|>"
+    else:
+        raise ValueError(f"Unsupported modality: {modality}")
+    prompt = ("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+              f"<|im_start|>user\n<|vision_start|>{placeholder}<|vision_end|>"
+              f"{question}<|im_end|>\n"
+              "<|im_start|>assistant\n")
+    stop_token_ids = None
+    return llm, prompt, stop_token_ids
+
+def get_multi_modal_input(args):
+    from PIL import Image
+    if args.modality == "image":
+        if args.output_type == 'html':
+            img_question = """
+            You are tasked with converting a scanned document image into a fully-renderable HTML document.
+            Provide a full HTML representation following detailed instructions.
+            """
+        elif args.output_type == 'doc_type':
+            img_question = """
+            Analyze the provided image and classify the document type from a predefined list.
+            Provide only the document type in plain text.
+            """
+        else:
+            raise ValueError(f"Unsupported output_type: {args.output_type}")
+        return {"question": img_question}
+    else:
+        raise ValueError(f"Modality {args.modality} is not supported.")
+
+def get_input_filepaths(folder_path, type_of_input):
+    filepaths = []
+    if type_of_input == 'images':
+        for file in os.listdir(folder_path):
+            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                filepaths.append(os.path.join(folder_path, file))
+    elif type_of_input == 'subfolder_images':
+        for imgfolder in os.listdir(folder_path):
+            subfolder_path = os.path.join(folder_path, imgfolder)
+            if not os.path.isdir(subfolder_path): continue
+            for imgfile in os.listdir(subfolder_path):
+                 if imgfile.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    filepaths.append(os.path.join(subfolder_path, imgfile))
+    return filepaths
+
+# --------------- Worker and Orchestrator Logic --------------- #
+
+def run_worker(args):
+    """
+    This function is executed by a worker process. It performs the actual inference.
+    """
+    from PIL import Image
+    from vllm import SamplingParams
+    Image.MAX_IMAGE_PIXELS = 933120000
+
+    print(f"--- Worker PID {os.getpid()} on GPUs {args.gpus} ---")
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+    gpu_ids = args.gpus.split(',')
+    tensor_parallel_size = len(gpu_ids)
+
+    with open(args.input_filelist, 'r') as f:
+        filepaths_to_process = json.load(f)
+    
+    if not filepaths_to_process:
+        print(f"Worker on GPUs {args.gpus} has no files to process. Exiting.")
+        return
+
+    print(f"Worker on GPUs {args.gpus} will process {len(filepaths_to_process)} images.")
+
+    mm_input = get_multi_modal_input(args)
+    question = mm_input["question"]
+    
+    llm, prompt, stop_token_ids = run_qwen2_5_vl(
+        question,
+        args.modality,
+        tensor_parallel_size=tensor_parallel_size,
+        disable_mm_preprocessor_cache=args.disable_mm_preprocessor_cache
+    )
+    sampling_params = SamplingParams(
+        temperature=0.8,
+        top_p=0.9,
+        top_k=50,
+        max_tokens=4096,
+        stop_token_ids=stop_token_ids
+    )
+
+    inputs = []
+    for filepath in filepaths_to_process:
+        try:
+            image = Image.open(filepath).convert("RGB")
+            inputs.append({
+                "prompt": prompt,
+                "multi_modal_data": {args.modality: image},
+                "image_name": os.path.basename(filepath)
+            })
+        except Exception as e:
+            print(f"Error loading {filepath}: {e}")
+
+    try:
+        outputs = llm.generate(inputs, sampling_params=sampling_params)
+        os.makedirs(args.output_html_dir, exist_ok=True)
+        for output in outputs:
+            image_name = output.prompt_token_ids['image_name']
+            generated_text = output.outputs[0].text
+            
+            output_filename = os.path.splitext(image_name)[0] + '.html'
+            output_path = os.path.join(args.output_html_dir, output_filename)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(generated_text)
+            print(f"Worker on GPUs {args.gpus} saved output to {output_path}")
+    except Exception as e:
+        print(f"Error during generation for worker on GPUs {args.gpus}: {e}")
+
+def orchestrate_jobs(args):
+    """
+    Finds free GPUs, partitions them, splits workload, and launches worker processes.
+    """
+    print("--- Running in Orchestrator Mode ---")
+    
+    free_gpus = get_free_gpus(min_mem_mb=args.min_gpu_memory_mb)
+    if not free_gpus:
+        raise RuntimeError("No suitable free GPUs found.")
+        
+    num_available = len(free_gpus)
+    print(f"Found {num_available} free GPUs: {', '.join(free_gpus)}")
+
+    tp_partitions = partition_gpus(num_available)
+    if not tp_partitions:
+        raise RuntimeError(f"Could not find a valid way to partition {num_available} GPUs.")
+    
+    print(f"Partitioning into {len(tp_partitions)} jobs with TP sizes: {tp_partitions}")
+
+    all_filepaths = get_input_filepaths(args.input_folder_path, args.type_of_input)
+    if not all_filepaths:
+        print("No input files found. Exiting.")
+        return
+        
+    print(f"Found {len(all_filepaths)} total images to process.")
+
+    gpu_idx_start, file_idx_start, worker_configs = 0, 0, []
+    total_gpus_in_partitions = sum(tp_partitions)
+
+    for i, tp_size in enumerate(tp_partitions):
+        gpu_idx_end = gpu_idx_start + tp_size
+        worker_gpus = free_gpus[gpu_idx_start:gpu_idx_end]
+        gpu_idx_start = gpu_idx_end
+
+        if i == len(tp_partitions) - 1:
+            worker_files = all_filepaths[file_idx_start:]
+        else:
+            proportion = tp_size / total_gpus_in_partitions
+            num_files_for_worker = math.floor(len(all_filepaths) * proportion)
+            file_idx_end = file_idx_start + num_files_for_worker
+            worker_files = all_filepaths[file_idx_start:file_idx_end]
+            file_idx_start = file_idx_end
+        
+        worker_configs.append({"gpus": ",".join(worker_gpus), "files": worker_files})
+    
+    processes = []
+    temp_dir = tempfile.mkdtemp(prefix="vllm_orch_")
+    print(f"Using temporary directory for file lists: {temp_dir}")
+
+    try:
+        for i, config in enumerate(worker_configs):
+            if not config['files']:
+                print(f"Skipping worker for GPUs {config['gpus']} as there are no files.")
+                continue
+
+            filelist_path = os.path.join(temp_dir, f"worker_{i}_files.json")
+            with open(filelist_path, 'w') as f:
+                json.dump(config['files'], f)
+
+            cmd = [
+                sys.executable, __file__,
+                '--worker',
+                '--gpus', config['gpus'],
+                '--input-filelist', filelist_path,
+                '--input-folder-path', args.input_folder_path,
+                '--output-html-dir', args.output_html_dir,
+                '--type-of-input', args.type_of_input,
+                '--output-type', args.output_type,
+                '--model-type', args.model_type,
+                '--modality', args.modality,
+                '--min-gpu-memory-mb', str(args.min_gpu_memory_mb),
+            ]
+            if args.disable_mm_preprocessor_cache:
+                cmd.append('--disable-mm-preprocessor-cache')
+
+            print(f"Launching worker {i} for TP={len(config['gpus'])} on GPUs [{config['gpus']}] with {len(config['files'])} files...")
+            processes.append(subprocess.Popen(cmd))
+
+        for p in processes:
+            p.wait()
+
+    finally:
+        print("All workers finished. Cleaning up temporary files.")
+        shutil.rmtree(temp_dir)
+
+    print("--- Orchestration Complete ---")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Orchestrates inference across all free GPUs. '
+                    'Settings are controlled by the CONFIG dictionary at the top of the script.'
+    )
+    
+    # --- Arguments are now defaulted from the CONFIG dictionary ---
+    parser.add_argument('--input-folder-path', default=CONFIG["input_folder_path"], type=str)
+    parser.add_argument('--output-html-dir', default=CONFIG["output_html_dir"], type=str)
+    parser.add_argument('--type-of-input', default=CONFIG["type_of_input"], type=str, choices=['images', 'subfolder_images'])
+    parser.add_argument('--output-type', default=CONFIG["output_type"], type=str, choices=['html', 'doc_type'])
+    parser.add_argument('--model-type', default=CONFIG["model_type"], type=str)
+    parser.add_argument('--modality', default=CONFIG["modality"], type=str)
+    parser.add_argument('--disable-mm-preprocessor-cache', action='store_true', default=CONFIG["disable_mm_preprocessor_cache"])
+    parser.add_argument('--min-gpu-memory-mb', default=CONFIG["min_gpu_memory_mb"], type=int)
+
+    # --- Internal arguments for worker processes ---
+    parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--gpus', type=str, help=argparse.SUPPRESS)
+    parser.add_argument('--input-filelist', type=str, help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+
+    # Override the default for the boolean flag if it was set to True in the config
+    if CONFIG["disable_mm_preprocessor_cache"]:
+        args.disable_mm_preprocessor_cache = True
+
+    if args.worker:
+        run_worker(args)
+    else:
+        orchestrate_jobs(args)
+
+if __name__ == "__main__":
+    main()
